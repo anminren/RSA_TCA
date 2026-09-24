@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.DS_Store
+
+# Datasets, pretrained models, checkpoints, and generated results are not
+# redistributed by this repository.
+/data/
+/pretrained_models/
+/outputs/
+/logs/
+/wandb/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+
+# Local credentials and environment overrides.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+secrets*

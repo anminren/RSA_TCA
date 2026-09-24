@@ -1,0 +1,74 @@
+# BART Derco 简单实现 (Encoder + Linear Head + MSE)
+# 模型可通过 --set model.model_name=... 切换 base / large-cnn
+
+experiment:
+  name: "bart_large_derco_timewindow"
+  device: "cuda"
+  seed: 42
+
+model:
+  backbone: "bart"
+  model_name: "facebook/bart-large-cnn"
+  pooling: "last"
+  gradient_checkpointing: true
+  freeze_decoder: true
+  n_channels: 32
+  brain_head_dropout: 0.3
+  # 简单实现不使用 MoCo
+  enable_moco: false
+  freeze_encoder: false
+
+loss:
+  lambda_brain: 1.0
+  lambda_moco: 0.0
+  lambda_anchor: 0.0
+  brain_loss_type: "mse"
+  anchor_type: "none"
+
+training:
+  max_epochs: 30
+  # Conservative public default; increase only after measuring GPU memory.
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  use_amp: true
+  amp_dtype: "fp16"
+  gradient_clip: 1.0
+
+  optimizer:
+    lr_encoder: 1e-5
+    lr_brain_head: 1e-4
+    weight_decay_encoder: 1e-4
+    weight_decay_head: 2e-4
+
+  scheduler:
+    warmup_ratio: 0.1
+
+  early_stopping:
+    enabled: true
+    patience: 5
+    min_delta: 0.0
+    mode: "correlation"
+    min_epochs: 10
+
+data:
+  dataset_type: "derco"
+  eeg_data_dir: "data/EEG-Data-Derco"
+  stimulus_dir: "data/EEG-Data-Derco"
+  article_ids: [0, 1, 2, 3, 4]
+  max_length: 128
+  target_type: "average"
+  split_ratio: [0.8, 0.1, 0.1]
+  split_seed: 42
+  sampling_rate: 1000
+  baseline_ms: 200
+  max_channels: 32
+  # Keep the complete epoch so "other" words use the available epoch.
+  max_timepoints: null
+  time_windows:
+    enabled: true
+    ner:
+      start_ms: 150
+      end_ms: 350
+    pos:
+      start_ms: 0
+      end_ms: 500
