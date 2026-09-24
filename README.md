@@ -1,39 +1,39 @@
 # Temporal Brain–Model Alignment for Factuality-Related Linguistic Cues in Generative Language Models
 
-Research code accompanying **“Temporal Brain-Model Alignment for Factuality-Related Linguistic Cues in Generative Language Models”** by Wenqing Zhou, Zhejun Zhang, Shaoting Guo, Lin Zhang, and Lei Li.
+Code accompanying **“Temporal Brain-Model Alignment for Factuality-Related Linguistic Cues in Generative Language Models”** by Wenqing Zhou, Zhejun Zhang, Shaoting Guo, Lin Zhang, and Lei Li.
 
-This release currently contains the EEG time-window tuning pipeline for BART-large and PEGASUS-large. It uses word-level DERCo EEG as supervision for source-side encoder representations and keeps the decoder frozen. The repository does **not** redistribute EEG data, FRANK data, pretrained model weights, checkpoints, or generated summaries.
+This repository contains both parts of the project:
 
-## Method implemented here
+1. the original **RSA-TCA analysis code** from the `RSA-TCA-1.0.0` release, including hidden-state extraction, time-course representational similarity analysis, factuality-conditioned analysis, significance testing, layer selection, and significant-area calculation;
+2. the **EEG time-window tuning pipeline** for BART-large and PEGASUS-large.
 
-For each subject and fold, the encoder receives the causal source context through the current word. The final-layer hidden states of the current word's subword tokens are mean-pooled, then mapped to an EEG sensor vector by a lightweight projection head. Training minimizes mean-squared error between that prediction and a time-window-averaged EEG topography.
-
-The paper-defined windows are:
-
-| Word category | EEG window |
-|---|---:|
-| Named entity | 150–350 ms |
-| Noun or verb | 0–500 ms |
-| Other | Mean over the available epoch |
-
-The decoder is frozen and no summarization loss or FRANK factual label is used during EEG tuning. FRANK is used only for paired baseline-versus-tuned evaluation.
-
-The checked-in learning rates, epoch limit, projection-head architecture, dropout, batching, optimizer, and scheduler are engineering settings recovered from the training project; they should not be interpreted as paper-defined methodological constants. The public batch defaults are deliberately conservative to reduce out-of-memory risk.
+The repository does not redistribute EEG recordings, participant-level arrays, pretrained weights, checkpoints, FRANK annotations, or generated experiment outputs.
 
 ## Repository layout
 
 ```text
-configs/train/                         BART-large and PEGASUS-large configs
-scripts/train.py                       DERCo/FRANK EEG training entry point
-scripts/evaluate_frank.py              baseline or tuned summary generation
+experiment_with_notes/                 Original RSA-TCA analysis code
+├── get_hidden_data_allModel.py        Extract encoder/decoder hidden states
+├── n_timepoints_anlysis.py            Time-course RSA at configurable resolution
+├── faculty_analysis.py                Factuality-conditioned RSA-TCA
+├── significance.py                    Wilcoxon tests over RSA time courses
+├── factuality_significance.py         Factuality-conditioned significance tests
+├── choose_layer.py                    Select layers from significant RSA scores
+├── factuality_choose_layer.py         Factuality-conditioned layer selection
+├── SigArea.py                         Area over significant time points
+└── xsum/                              Selected source/target stimuli from the release
+
+configs/train/                         BART-large and PEGASUS-large tuning configs
+scripts/train.py                       DERCo EEG tuning entry point
+scripts/evaluate_frank.py              Baseline or tuned summary generation
 scripts/evaluate_frank_subset_compare.py
-scripts/compute_frank_metrics.py       descriptive evaluation utilities
+scripts/compute_frank_metrics.py       Descriptive evaluation utilities
 scripts/analyze_frank_by_errors.py
-src/data/                              stimulus, event, EEG, and token alignment
-src/models/                            encoder wrappers and EEG mapper
-src/losses/                            MSE and optional exploratory losses
-src/training/                          training, validation, and checkpointing
-tests/                                 safety and time-window tests
+src/data/                              Stimulus, event, EEG, and token alignment
+src/models/                            Encoder wrappers and EEG mapper
+src/losses/                            Tuning objectives
+src/training/                          Training, validation, and checkpointing
+tests/                                 Safety, alignment, and smoke tests
 ```
 
 ## Installation
@@ -44,15 +44,82 @@ Python 3.9 or newer is supported; Python 3.10 or newer is recommended.
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[test]'
+python -m pip install -e '.[analysis,test]'
 python -m spacy download en_core_web_sm
 ```
 
-The default configurations download `facebook/bart-large-cnn` or `google/pegasus-large` from Hugging Face. To run fully offline, set `model.model_name` to a trusted local model directory.
+The scripts can download public models from Hugging Face. For an offline run, pass a trusted local model directory instead. Review model and dataset licenses before use.
 
-## Data preparation
+## Part I: RSA-TCA analysis
 
-Obtain DERCo from its official distribution and follow its terms and ethics requirements. This code expects the preprocessed layout below; preprocessing arrays are intentionally absent from Git:
+### Expected data layout
+
+The analysis scripts retain the relative layout used by the original release:
+
+```text
+hidden_states/
+├── bart_base_encoder_align.npy
+├── bart_encoder_align.npy
+└── ...
+npy_bart2/
+├── art_1/
+│   ├── Overall/sub_1_art_1_epo.npy
+│   ├── N400/...
+│   └── P600/...
+└── ...
+spearman_corr/
+├── spearman/
+└── p_value/
+significance/
+factuality_significance/
+plots/
+```
+
+The large hidden-state, EEG, intermediate, and result arrays shown above are intentionally not committed. Obtain the relevant data through its authorized distribution and preserve its consent, ethics, and license restrictions.
+
+### Procedure
+
+1. Prepare a compatible encoder-decoder model. Models used in the original experiment included BART, PEGASUS, and T5 variants. Two model identifiers recorded in the release were `sysresearch101/t5-large-finetuned-xsum-cnn` and `jordiclive/flan-t5-3b-summarizer`; availability and exact revisions may change.
+
+2. From `experiment_with_notes/`, extract hidden states:
+
+   ```python
+   from get_hidden_data_allModel import get_hidden_data
+
+   get_hidden_data("trusted/model/path-or-id")
+   ```
+
+   The original study manually aligned each model's tokens to the PEGASUS tokenization and stored the result as `{model_name}_encoder_align.npy`.
+
+3. Compute the overall or factuality-conditioned RSA time course:
+
+   ```python
+   from n_timepoints_anlysis import n_timepoints_analysis
+   from faculty_analysis import faculty_analysis
+
+   n_timepoints_analysis(model_name, n_timepoints)
+   faculty_analysis(model_name, n_timepoints, factuality_type)
+   ```
+
+4. Run `all_run()` from `significance.py` or `factuality_significance.py` after setting the cases at the top of the script.
+
+5. Run `choose_layer()` from `choose_layer.py` or `factuality_choose_layer.py`, then use `SigArea.py` for significant-area summaries.
+
+These scripts are research workflows rather than a one-command benchmark. Check array shapes, model revisions, manual token alignments, subject definitions, and analysis choices before interpreting or comparing results.
+
+## Part II: EEG time-window tuning
+
+For each subject and fold, the encoder receives the causal source context through the current word. Final-layer hidden states for the current word's subword tokens are mean-pooled and mapped to an EEG sensor vector. Training minimizes mean-squared error against a time-window-averaged EEG topography.
+
+| Word category | EEG window |
+|---|---:|
+| Named entity | 150–350 ms |
+| Noun or verb | 0–500 ms |
+| Other | Mean over the available epoch |
+
+The decoder is frozen. No summarization loss or FRANK factual label is used during EEG tuning; FRANK is used only for paired baseline-versus-tuned evaluation. Learning rates, epoch limits, projection architecture, dropout, optimizer, and scheduler in the checked-in configs are recovered engineering settings, not paper-defined constants.
+
+### DERCo preparation
 
 ```text
 data/EEG-Data-Derco/
@@ -66,13 +133,11 @@ data/EEG-Data-Derco/
     └── ...
 ```
 
-`event_numbers` are used explicitly to map EEG epochs to words; array row numbers are not treated as word indices. The loader validates dimensions, event counts, event bounds, and channel counts before training. DERCo stimulus pickles are loaded by a restricted data-only unpickler because ordinary pickle loading can execute code.
+`event_numbers` map EEG epochs to words; array row numbers are not treated as word indices. The loader validates dimensions, event counts, event bounds, channel counts, and target alignment. DERCo stimulus pickles use a restricted data-only unpickler because unrestricted pickle loading can execute code.
 
-The recovered project used 1000 Hz DERCo epochs with a 200 ms pre-stimulus baseline. If your preprocessing differs, update `sampling_rate` and `baseline_ms` rather than reusing the defaults blindly.
+The recovered setup used 1000 Hz epochs with a 200 ms pre-stimulus baseline. If your preprocessing differs, change `sampling_rate` and `baseline_ms`.
 
-## Training
-
-BART-large:
+### Training
 
 ```bash
 python scripts/train.py \
@@ -80,11 +145,7 @@ python scripts/train.py \
   --subject SUBJECT_ID \
   --n_folds 5 \
   --fold 0
-```
 
-PEGASUS-large:
-
-```bash
 python scripts/train.py \
   --config configs/train/pegasus_large_derco_timewindow.yaml \
   --subject SUBJECT_ID \
@@ -105,9 +166,7 @@ python scripts/train.py \
 
 Checkpoints contain trainable tensors only and are written under `outputs/`, which is ignored by Git.
 
-## FRANK evaluation
-
-Generate a baseline or load a trusted EEG-tuned checkpoint:
+### FRANK evaluation
 
 ```bash
 python scripts/evaluate_frank.py \
@@ -122,34 +181,19 @@ python scripts/evaluate_frank.py \
   --output_dir outputs/frank_eval/tuned
 ```
 
-PyTorch checkpoints are loaded with `weights_only=True`. Do not weaken this safeguard for an untrusted checkpoint.
+PyTorch checkpoints are loaded with `weights_only=True`; do not weaken this safeguard for an untrusted checkpoint. Reproducing paper-level results requires the same authorized data, preprocessing, subject/fold definitions, decoding settings, and annotations.
 
-The scripts provide generation and descriptive comparison support. They do not reconstruct unavailable human judgments, unpublished data splits, or missing experimental metadata. Reproducing paper-level numerical results requires the same authorized datasets, preprocessing, subject/fold definitions, decoding settings, and evaluation annotations.
-
-## Verification
+## Verification and safety
 
 ```bash
-python -m compileall -q src scripts tests
+python -m compileall -q experiment_with_notes src scripts tests
 pytest -q
 ```
 
-Before publishing a change, also confirm that no dataset, weight, checkpoint, output, credential, server path, or participant-level result is staged:
+See [SECURITY.md](SECURITY.md). Internal batch scripts, destructive output-rotation commands, machine-specific paths, credentials, logs, datasets, weights, checkpoints, and participant-level results are excluded. Never commit participant data or secrets.
 
-```bash
-git status --short
-git diff --cached --stat
-```
-
-## Safety and privacy
-
-See [SECURITY.md](SECURITY.md). The release excludes internal batch scripts, destructive output-rotation commands, machine-specific paths, logs, datasets, model weights, checkpoints, and result tables. Never commit participant data or credentials. Review the license and consent terms of every external dataset before use or redistribution.
-
-## Provenance and limitations
-
-The tuning implementation was restored from a research training snapshot and sanitized for public release. The earlier repository named `RSA-TCA` was unavailable during this migration, so no code or README text from that repository was copied. This release therefore covers the verified EEG tuning workflow, not a claimed byte-for-byte migration of unavailable code.
-
-No software license has been selected for this repository. Until the authors add one, copyright law reserves reuse rights by default.
+No software license was present in the supplied `RSA-TCA-1.0.0` archive, and none has been inferred here. Until the authors add one, copyright law reserves reuse rights by default.
 
 ## Citation
 
-The formal citation will be added when the paper metadata is publicly available. Until then, please cite the paper by title and authors listed above.
+Formal publication metadata will be added when available. Until then, cite the paper by the title and authors shown above.

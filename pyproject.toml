@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "temporal-brain-model-alignment"
 version = "0.1.0"
-description = "EEG time-window tuning for source-side representations in sequence-to-sequence language models"
+description = "RSA-TCA analysis and EEG time-window tuning for generative language models"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -27,6 +27,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+analysis = [
+  "matplotlib>=3.7",
+  "seaborn>=0.12",
+]
 lora = ["peft>=0.8"]
 test = ["pytest>=7.4"]
 
