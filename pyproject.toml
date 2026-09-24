@@ -24,6 +24,7 @@ dependencies = [
   "scipy>=1.10",
   "spacy>=3.6,<3.8",
   "sentencepiece>=0.1.99",
+  "rouge-score>=0.1.2",
 ]
 
 [project.optional-dependencies]

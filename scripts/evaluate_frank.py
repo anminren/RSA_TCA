@@ -30,6 +30,7 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -56,6 +57,14 @@ def setup_logging():
 
 def load_model_with_checkpoint(model_name: str, checkpoint_path: str = None):
     """加载 seq2seq 模型，可选加载 EEG 微调后的 encoder checkpoint。"""
+    checkpoint = None
+    if checkpoint_path:
+        checkpoint = Path(checkpoint_path)
+        if not checkpoint.is_file():
+            # Fail before resolving/downloading the base model.  Falling back to
+            # it here would make a requested fine-tuned evaluation a baseline.
+            raise FileNotFoundError(f"Checkpoint 不存在: {checkpoint}")
+
     is_local = Path(model_name).is_dir()
     cfg = AutoConfig.from_pretrained(model_name, local_files_only=is_local)
     use_fast = not getattr(cfg, "model_type", "").startswith("pegasus")
@@ -69,12 +78,14 @@ def load_model_with_checkpoint(model_name: str, checkpoint_path: str = None):
         use_fast=use_fast,
     )
 
-    if checkpoint_path and Path(checkpoint_path).exists():
-        logger.info(f"加载微调 checkpoint: {checkpoint_path}")
+    if checkpoint is not None:
+        logger.info(f"加载微调 checkpoint: {checkpoint}")
         # ``weights_only=True`` prevents checkpoint pickle payloads from
         # importing or executing arbitrary Python objects.
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
         state_dict = ckpt.get("model_state_dict", ckpt)
+        if not isinstance(state_dict, Mapping):
+            raise TypeError("Checkpoint 的 model_state_dict 必须是参数映射")
         is_lora = any("lora_A" in k or "lora_B" in k for k in state_dict)
 
         if is_lora:
@@ -91,11 +102,17 @@ def load_model_with_checkpoint(model_name: str, checkpoint_path: str = None):
                 bias="none",
             )
             model = get_peft_model(model, lora_cfg)
-            logger.info(f"检测到 LoRA checkpoint，已包装 Seq2SeqLM: r={r}, alpha={2 * int(r)}")
+            logger.info(
+                "检测到 LoRA checkpoint，已包装 Seq2SeqLM: r=%s, alpha=%s",
+                r,
+                lora_cfg.lora_alpha,
+            )
 
         model_state = model.state_dict()
         loaded = 0
         skipped = 0
+        loaded_encoder_keys = set()
+        unmatched_encoder_lora_keys = []
         for k, v in state_dict.items():
             candidates = []
             if is_lora:
@@ -109,18 +126,61 @@ def load_model_with_checkpoint(model_name: str, checkpoint_path: str = None):
                 candidates.append("model." + k[len("encoder."):])
             candidates.append(k)
 
-            new_k = next((c for c in candidates if c in model_state and model_state[c].shape == v.shape), None)
+            new_k = next(
+                (
+                    c
+                    for c in candidates
+                    if c in model_state
+                    and hasattr(v, "shape")
+                    and model_state[c].shape == v.shape
+                ),
+                None,
+            )
             if new_k is not None:
                 model_state[new_k].copy_(v)
                 loaded += 1
+                if new_k.startswith("encoder.") or ".encoder." in new_k:
+                    loaded_encoder_keys.add(new_k)
             else:
                 skipped += 1
+                if is_lora and ("lora_A" in k or "lora_B" in k) and (
+                    k.startswith("encoder.") or ".encoder." in k
+                ):
+                    unmatched_encoder_lora_keys.append(k)
                 if not k.startswith("brain_head"):
                     logger.warning(f"Checkpoint key {k} 无匹配，跳过")
+
+        if not loaded_encoder_keys:
+            raise RuntimeError(
+                "Checkpoint 没有可加载到生成模型 encoder 的微调参数；"
+                "brain_head 或 decoder 参数不能用于 FRANK 生成评估"
+            )
+
+        if is_lora:
+            expected_encoder_lora_keys = {
+                k
+                for k in model_state
+                if ("lora_A" in k or "lora_B" in k)
+                and (k.startswith("encoder.") or ".encoder." in k)
+            }
+            loaded_encoder_lora_keys = {
+                k
+                for k in loaded_encoder_keys
+                if "lora_A" in k or "lora_B" in k
+            }
+            missing_encoder_lora_keys = expected_encoder_lora_keys - loaded_encoder_lora_keys
+            if missing_encoder_lora_keys or unmatched_encoder_lora_keys:
+                details = []
+                if missing_encoder_lora_keys:
+                    details.append(
+                        f"模型所需但 checkpoint 缺失 {len(missing_encoder_lora_keys)} 个"
+                    )
+                if unmatched_encoder_lora_keys:
+                    details.append(
+                        f"checkpoint 中无法映射 {len(unmatched_encoder_lora_keys)} 个"
+                    )
+                raise RuntimeError("LoRA encoder 参数加载不完整：" + "，".join(details))
         logger.info(f"Checkpoint 加载完成: loaded={loaded}, skipped={skipped}, total={len(state_dict)}")
-    else:
-        if checkpoint_path:
-            logger.warning(f"Checkpoint 不存在: {checkpoint_path}，使用原始模型")
 
     return model, tokenizer
 
@@ -145,6 +205,7 @@ def generate_summary(model, tokenizer, article: str, device, max_length=1024, ma
             min_length=10,
             length_penalty=2.0,
             num_beams=4,
+            do_sample=False,
             early_stopping=True,
         )
     summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)

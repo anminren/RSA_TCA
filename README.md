@@ -27,6 +27,7 @@ configs/train/                         BART-large and PEGASUS-large tuning confi
 scripts/train.py                       DERCo EEG tuning entry point
 scripts/evaluate_frank.py              Baseline or tuned summary generation
 scripts/evaluate_frank_subset_compare.py
+scripts/summarize_frank_subset_eval.py Aggregate schema-v2 fold diagnostics
 scripts/compute_frank_metrics.py       Descriptive evaluation utilities
 scripts/analyze_frank_by_errors.py
 src/data/                              Stimulus, event, EEG, and token alignment
@@ -182,6 +183,43 @@ python scripts/evaluate_frank.py \
 ```
 
 PyTorch checkpoints are loaded with `weights_only=True`; do not weaken this safeguard for an untrusted checkpoint. Reproducing paper-level results requires the same authorized data, preprocessing, subject/fold definitions, decoding settings, and annotations.
+
+The subset comparison reports descriptive diagnostics rather than factuality judgements. A lexical flag means only that the summary contains an entity-like regular-expression match or number that does not occur literally in the source article. It does not establish that the summary is factually incorrect or that one checkpoint is better than another. The reported ROUGE-L difference is a reference-overlap measure and has the same limitation.
+
+Legacy BART human labels are attached to a generated summary only when the originally annotated summary and the current summary are identical after whitespace normalization. The alignment is otherwise reported as `different_summary`, `missing_original_summary`, or `missing_annotation`; these cases remain unknown and are not assigned the original summary's factual label.
+
+To recompute schema-v2 diagnostics from generation JSON files that already exist in `baseline_dir` and `output_dir`, without loading a model or generating summaries, run:
+
+```bash
+python scripts/evaluate_frank_subset_compare.py \
+  --model_name facebook/bart-large-cnn \
+  --checkpoint outputs/bart_large_derco_timewindow/SUBJECT_ID/fold_0/best_model.pt \
+  --frank_data /absolute/path/to/frank/data \
+  --baseline_dir outputs/frank_subset_eval/baseline \
+  --output_dir outputs/frank_subset_eval/SUBJECT_ID_fold0 \
+  --compare_only
+```
+
+Generation JSON files created by an older checkout do not contain enough provenance to verify the model revision, checkpoint, decoding configuration, or code that produced them. `--compare_only` therefore records their generation provenance as unknown; it only recomputes the current diagnostics. To deliberately bypass cached generations and rerun the model, add `--regenerate` to the normal evaluation command:
+
+```bash
+python scripts/evaluate_frank_subset_compare.py \
+  --model_name facebook/bart-large-cnn \
+  --checkpoint outputs/bart_large_derco_timewindow/SUBJECT_ID/fold_0/best_model.pt \
+  --frank_data /absolute/path/to/frank/data \
+  --baseline_dir outputs/frank_subset_eval/baseline \
+  --output_dir outputs/frank_subset_eval/SUBJECT_ID_fold0 \
+  --device cuda \
+  --regenerate
+```
+
+After evaluating folds, combine only schema-v2 summaries with:
+
+```bash
+python scripts/summarize_frank_subset_eval.py outputs/frank_subset_eval/CONDITION
+```
+
+The summarizer rejects legacy summaries and directs the user to `--compare_only`; it never substitutes zero for unavailable fields. Updating this evaluation code does not retrospectively verify counts reported in the paper or establish the provenance of old cached results.
 
 ## Verification and safety
 

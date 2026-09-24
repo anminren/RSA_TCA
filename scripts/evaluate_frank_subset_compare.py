@@ -1,234 +1,359 @@
 #!/usr/bin/env python3
-"""Evaluate seq2seq models/checkpoints on the BART-annotated FRANK subset and compare to model-specific baseline.
+"""Paired descriptive diagnostics on articles annotated for the original FRANK BART.
 
-This script uses all hashes where FRANK has human annotations for the original `bart` system: 250 samples, including 46 error-labelled and 204 no-error-labelled cases.
-For non-BART backbones, the model-specific pretrained generation is used as baseline.
+Human labels belong to the annotated summary, not an article or a new generation.
+Lexical absence and ROUGE are diagnostics, not factuality judgments.
 """
 import argparse
 import csv
+import hashlib
 import json
+import math
 import re
 import sys
+from collections import Counter
 from pathlib import Path
-from collections import Counter, defaultdict
-
-from rouge_score import rouge_scorer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts.evaluate_frank import load_model_with_checkpoint, generate_summary, load_frank_data
-
+SCHEMA_VERSION = 2
 ERROR_TYPES = [
     "EntE", "RelE", "CircE", "OutE", "GramE", "CorefE", "LinkE",
     "Semantic_Frame_Errors", "Discourse_Errors", "Content_Verifiability_Errors",
 ]
 ENTITY_RE = re.compile(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|[A-Z]{2,}|\d+(?:\.\d+)?%?|£\d+(?:\.\d+)?m?|\$\d+(?:\.\d+)?m?|\d{4})\b")
+TRANSITIONS = ("flagged_to_clear", "clear_to_flagged", "flagged_to_flagged", "clear_to_clear")
+ALIGNMENT_STATES = ("matched", "different_summary", "missing_original_summary", "missing_annotation")
+RESULTS_NAME = "frank_subset_generation_results.json"
+MANIFEST_NAME = "generation_manifest.json"
+SCREEN_NOTE = (
+    "A lexical flag means a regex-extracted item was not found literally in the "
+    "article. Clear does not establish factual consistency; ROUGE measures "
+    "reference overlap. Neither diagnostic establishes factual-error correction."
+)
 
 
 def normalize(text):
+    """Normalize whitespace only; preserve case, punctuation, and word order."""
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, value):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, ensure_ascii=False, allow_nan=False)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def text_sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def rouge_pair(ref, pred):
+    from rouge_score import rouge_scorer
     scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
-    s = scorer.score(ref or "", pred or "")
-    return {k: s[k].fmeasure for k in ("rouge1", "rouge2", "rougeL")}
+    scores = scorer.score(ref, pred)
+    return {key: scores[key].fmeasure for key in ("rouge1", "rouge2", "rougeL")}
 
 
 def token_edit_ratio(a, b):
     import difflib
-    aa, bb = (a or "").split(), (b or "").split()
-    if not aa and not bb:
-        return 0.0
-    return 1.0 - difflib.SequenceMatcher(None, aa, bb).ratio()
+    return 1.0 - difflib.SequenceMatcher(None, a.split(), b.split()).ratio()
 
 
-def unsupported_items(summary, article):
-    article_l = (article or "").lower()
-    items = []
-    for ent in ENTITY_RE.findall(summary or ""):
-        e = ent.strip()
-        if len(e) <= 1:
+def lexically_absent_items(summary, article):
+    """Literal diagnostic only; absence can be a paraphrase and presence a lie."""
+    article_text = normalize(article).casefold()
+    items = set()
+    for entity in ENTITY_RE.findall(normalize(summary)):
+        entity = entity.strip()
+        if len(entity) <= 1:
             continue
-        if e.lower() not in article_l:
-            items.append(e)
-    return sorted(set(items))
+        pattern = r"(?<!\w)" + re.escape(entity.casefold()) + r"(?!\w)"
+        if not re.search(pattern, article_text):
+            items.add(entity)
+    return sorted(items)
+
+
+def annotation_error_status(annotation):
+    observed = {}
+    for key in ERROR_TYPES:
+        value = annotation.get(key)
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and 0 <= value <= 1):
+            observed[key] = value
+    errors = [key for key, value in observed.items() if value < 1.0]
+    # Missing scores must not silently become a no-error label.
+    status = True if errors else (False if all(key in observed for key in ERROR_TYPES[:7]) else None)
+    return errors, status
 
 
 def build_bart_error_subset(frank_dir):
-    benchmark_data, ann_map_tuple = load_frank_data(str(frank_dir))
-    anns = json.load(open(Path(frank_dir) / "human_annotations.json", encoding="utf-8"))
+    frank_dir = Path(frank_dir)
+    benchmark = read_json(frank_dir / "benchmark_data.json")
+    annotations = read_json(frank_dir / "human_annotations.json")
+    original_rows = {}
+    for item in benchmark:
+        if item.get("model_name") != "bart":
+            continue
+        key = item["hash"]
+        if key in original_rows and any(original_rows[key].get(field) != item.get(field)
+                                       for field in ("article", "reference", "summary")):
+            raise ValueError(f"Conflicting original BART records for {key}")
+        original_rows[key] = item
     ann_by_hash = {}
-    selected = []
-    seen = set()
-    for ann in anns:
+    for ann in annotations:
         if ann.get("model_name") != "bart":
             continue
-        errs = []
-        for et in ERROR_TYPES:
-            v = ann.get(et, 1.0)
-            if isinstance(v, (int, float)) and v < 1.0:
-                errs.append(et)
-        ann_by_hash[ann["hash"]] = {
-            "errors": errs,
-            "has_bart_error": bool(errs),
-            "annotation": ann,
+        key = ann["hash"]
+        if key in ann_by_hash and ann_by_hash[key]["annotation"] != ann:
+            raise ValueError(f"Conflicting BART annotations for {key}")
+        if key not in original_rows:
+            raise ValueError(f"Missing annotated original BART summary for {key}")
+        errors, has_error = annotation_error_status(ann)
+        ann_by_hash[key] = {
+            "errors": errors, "has_bart_error": has_error, "annotation": ann,
+            "original_summary": original_rows[key].get("summary", ""),
         }
-        selected.append(ann["hash"])
-    selected_set = set(selected)
-    rows = []
-    for item in benchmark_data:
-        h = item["hash"]
-        if h in selected_set and h not in seen:
-            seen.add(h)
-            rows.append(item)
+    rows = [item for key, item in original_rows.items() if key in ann_by_hash]
+    if not rows:
+        raise ValueError("No BART-annotated articles found")
     return rows, ann_by_hash
 
 
-def generate_results(model_name, checkpoint, frank_dir, output_dir, device):
+def generation_context(model_name, checkpoint, frank_dir):
+    checkpoint_info = None
+    if checkpoint:
+        path = Path(checkpoint).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+        checkpoint_info = {"path": str(path), "sha256": file_sha256(path)}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "model_name": str(Path(model_name).resolve()) if Path(model_name).exists() else model_name,
+        "checkpoint": checkpoint_info,
+        "dataset_sha256": {name: file_sha256(Path(frank_dir) / name)
+                           for name in ("benchmark_data.json", "human_annotations.json")},
+        "generator_sha256": file_sha256(Path(__file__).with_name("evaluate_frank.py")),
+        "decoding": {"max_article_length": 1024, "max_summary_length": 142,
+                     "min_length": 10, "num_beams": 4, "length_penalty": 2.0,
+                     "do_sample": False, "early_stopping": True},
+    }
+
+
+def generate_results(model_name, checkpoint, frank_dir, output_dir, device, context=None):
     import torch
+    from scripts.evaluate_frank import load_model_with_checkpoint, generate_summary
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    subset, ann_by_hash = build_bart_error_subset(frank_dir)
+    context = context or generation_context(model_name, checkpoint, frank_dir)
+    subset, _ = build_bart_error_subset(frank_dir)
     model, tokenizer = load_model_with_checkpoint(model_name, checkpoint)
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
     model.to(dev)
     model.eval()
     results = []
-    for i, item in enumerate(subset, 1):
-        h = item["hash"]
-        summary = generate_summary(model, tokenizer, item["article"], dev)
-        ann = ann_by_hash.get(h, {})
+    for index, item in enumerate(subset, 1):
         results.append({
-            "index": i,
-            "hash": h,
-            "dataset": item.get("dataset", ""),
-            "split": item.get("split", ""),
-            "article": item.get("article", ""),
-            "reference": item.get("reference", ""),
-            "generated_summary": summary,
-            "bart_error_types": ann.get("errors", []),
-            "has_bart_error": ann.get("has_bart_error", False),
-            "bart_annotation": ann.get("annotation", {}),
+            "index": index, "hash": item["hash"],
+            "dataset": item.get("dataset", ""), "split": item.get("split", ""),
+            "article": item["article"], "reference": item.get("reference", ""),
+            "generated_summary": generate_summary(model, tokenizer, item["article"], dev),
         })
-    with open(output_dir / "frank_subset_generation_results.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    with open(output_dir / "statistics.json", "w", encoding="utf-8") as f:
-        json.dump({"total_samples": len(results), "subset": "bart_annotated_250_hashes", "checkpoint": checkpoint}, f, indent=2, ensure_ascii=False)
+    write_json(output_dir / RESULTS_NAME, results)
+    write_json(output_dir / MANIFEST_NAME, {"context": context,
+               "results_sha256": file_sha256(output_dir / RESULTS_NAME)})
+    write_json(output_dir / "statistics.json", {
+        "total_samples": len(results), "subset": "articles_annotated_for_original_bart",
+        "model_name": model_name, "checkpoint": checkpoint,
+    })
     return results
 
 
-def load_or_generate(model_name, checkpoint, frank_dir, output_dir, device):
-    path = output_dir / "frank_subset_generation_results.json"
-    if path.exists():
-        return json.load(open(path, encoding="utf-8"))
-    return generate_results(model_name, checkpoint, frank_dir, output_dir, device)
+def load_or_generate(model_name, checkpoint, frank_dir, output_dir, device, regenerate=False):
+    output_dir = Path(output_dir)
+    path = output_dir / RESULTS_NAME
+    context = generation_context(model_name, checkpoint, frank_dir)
+    if path.exists() and not regenerate:
+        manifest_path = output_dir / MANIFEST_NAME
+        if not manifest_path.exists():
+            raise ValueError("Legacy cache has no generation manifest; use --compare_only for "
+                             "diagnostics with unknown provenance, or --regenerate")
+        manifest = read_json(manifest_path)
+        if manifest.get("context") != context or manifest.get("results_sha256") != file_sha256(path):
+            raise ValueError("Generation cache does not match this run; choose a new directory "
+                             "or use --regenerate")
+        return read_json(path)
+    return generate_results(model_name, checkpoint, frank_dir, output_dir, device, context)
 
 
-def compare(baseline, finetuned, output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    base_map = {r["hash"]: r for r in baseline}
+def read_cached_for_comparison(output_dir):
+    path = Path(output_dir) / RESULTS_NAME
+    manifest_path = Path(output_dir) / MANIFEST_NAME
+    provenance = {"status": "legacy_unverified", "results_sha256": file_sha256(path)}
+    if manifest_path.exists():
+        manifest = read_json(manifest_path)
+        if manifest.get("results_sha256") != provenance["results_sha256"]:
+            raise ValueError(f"Cached results differ from their manifest: {path}")
+        provenance.update(status="saved_manifest_content_verified", manifest=manifest,
+                          checkpoint_revalidated=False)
+    return read_json(path), provenance
+
+
+def index_results(results, side):
+    if not isinstance(results, list) or not results:
+        raise ValueError(f"{side}: expected nonempty generation results")
+    indexed = {}
+    for row in results:
+        key = row.get("hash")
+        if not isinstance(key, str) or not key or key in indexed:
+            raise ValueError(f"{side}: missing or duplicate hash {key!r}")
+        for field in ("article", "reference", "generated_summary"):
+            if not isinstance(row.get(field), str):
+                raise ValueError(f"{side}: missing or invalid {field} for {key}")
+        if not normalize(row["article"]) or not normalize(row["generated_summary"]):
+            raise ValueError(f"{side}: empty article or generated summary for {key}")
+        indexed[key] = row
+    return indexed
+
+
+def aligned_label(summary, metadata):
+    if not metadata or not metadata.get("annotation"):
+        return "unknown", "missing_annotation"
+    original = metadata.get("original_summary")
+    if not isinstance(original, str) or not normalize(original):
+        return "unknown", "missing_original_summary"
+    if normalize(summary) != normalize(original):
+        return "unknown", "different_summary"
+    label = {True: "error", False: "no_error", None: "unknown"}[metadata.get("has_bart_error")]
+    return label, "matched"
+
+
+def compare(baseline, finetuned, output_dir, ann_by_hash=None, provenance=None):
+    base_map, tuned_map = index_results(baseline, "baseline"), index_results(finetuned, "finetuned")
+    if base_map.keys() != tuned_map.keys():
+        raise ValueError("Baseline and finetuned sample hash sets differ; no silent intersection allowed")
+    ann_by_hash = ann_by_hash or {}
     rows = []
-    by_error = defaultdict(list)
-    for ft in finetuned:
-        h = ft["hash"]
-        b = base_map.get(h)
-        if not b:
-            continue
-        ref = ft.get("reference", "")
-        article = ft.get("article", "")
-        bs = b.get("generated_summary", "")
-        fs = ft.get("generated_summary", "")
-        br = rouge_pair(ref, bs)
-        fr = rouge_pair(ref, fs)
-        bu = unsupported_items(bs, article)
-        fu = unsupported_items(fs, article)
-        diff_l = fr["rougeL"] - br["rougeL"]
-        unsupported_delta = len(fu) - len(bu)
-        if unsupported_delta < 0 or diff_l > 0.02:
-            judgement = "likely_improved"
-        elif unsupported_delta > 0 or diff_l < -0.02:
-            judgement = "likely_worse"
-        else:
-            judgement = "neutral_or_changed"
-        row = {
-            "hash": h,
-            "bart_error_types": ";".join(ft.get("bart_error_types", [])),
-            "has_bart_error": ft.get("has_bart_error", False),
-            "judgement": judgement,
-            "diff_rougeL": diff_l,
-            "diff_rouge1": fr["rouge1"] - br["rouge1"],
-            "baseline_rougeL": br["rougeL"],
-            "finetuned_rougeL": fr["rougeL"],
+    alignment_counts = {side: Counter({state: 0 for state in ALIGNMENT_STATES})
+                        for side in ("baseline", "finetuned")}
+    for key, b in base_map.items():
+        ft = tuned_map[key]
+        for field in ("article", "reference"):
+            if b[field] != ft[field]:
+                raise ValueError(f"Mismatched {field} for {key}")
+        ref, article = b["reference"], b["article"]
+        bs, fs = b["generated_summary"], ft["generated_summary"]
+        br, fr = rouge_pair(ref, bs), rouge_pair(ref, fs)
+        bu, fu = lexically_absent_items(bs, article), lexically_absent_items(fs, article)
+        metadata = ann_by_hash.get(key, {})
+        baseline_label, baseline_status = aligned_label(bs, metadata)
+        tuned_label, tuned_status = aligned_label(fs, metadata)
+        alignment_counts["baseline"][baseline_status] += 1
+        alignment_counts["finetuned"][tuned_status] += 1
+        transition = ("flagged" if bu else "clear") + "_to_" + ("flagged" if fu else "clear")
+        rows.append({
+            "hash": key,
+            "original_bart_error_types": ";".join(metadata.get("errors", [])),
+            "original_bart_has_error": metadata.get("has_bart_error"),
+            "original_bart_summary": metadata.get("original_summary", ""),
+            "baseline_frank_label": baseline_label, "finetuned_frank_label": tuned_label,
+            "baseline_annotation_status": baseline_status, "finetuned_annotation_status": tuned_status,
+            "baseline_summary_sha256": text_sha256(bs), "finetuned_summary_sha256": text_sha256(fs),
+            "lexical_screen_transition": transition,
+            "baseline_lexically_absent_count": len(bu), "finetuned_lexically_absent_count": len(fu),
+            "lexical_absence_delta": len(fu) - len(bu),
+            "baseline_lexically_absent_items": ";".join(bu), "finetuned_lexically_absent_items": ";".join(fu),
+            "diff_rougeL": fr["rougeL"] - br["rougeL"], "diff_rouge1": fr["rouge1"] - br["rouge1"],
+            "baseline_rougeL": br["rougeL"], "finetuned_rougeL": fr["rougeL"],
             "edit_ratio": token_edit_ratio(bs, fs),
-            "baseline_unsupported_count": len(bu),
-            "finetuned_unsupported_count": len(fu),
-            "unsupported_delta": unsupported_delta,
-            "baseline_unsupported_items": ";".join(bu),
-            "finetuned_unsupported_items": ";".join(fu),
-            "reference": ref,
-            "baseline_summary": bs,
-            "finetuned_summary": fs,
-            "article_head": article[:800],
-        }
-        rows.append(row)
-        for et in ft.get("bart_error_types", []):
-            by_error[et].append(row)
-    fields = list(rows[0].keys()) if rows else []
-    with open(output_dir / "subset_comparison.csv", "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader(); w.writerows(rows)
-    counts = Counter(r["judgement"] for r in rows)
+            "reference": ref, "baseline_summary": bs, "finetuned_summary": fs, "article": article,
+        })
+    counts = Counter({transition: 0 for transition in TRANSITIONS})
+    counts.update(row["lexical_screen_transition"] for row in rows)
     summary = {
-        "n_samples": len(rows),
-        "judgement_counts": dict(counts),
-        "mean_diff_rougeL": sum(r["diff_rougeL"] for r in rows) / len(rows) if rows else 0,
-        "mean_unsupported_delta": sum(r["unsupported_delta"] for r in rows) / len(rows) if rows else 0,
-        "error_labelled": {},
-        "no_error_labelled": {},
-        "by_error_type": {},
+        "schema_version": SCHEMA_VERSION, "n_samples": len(rows), "screen_note": SCREEN_NOTE,
+        "lexical_screen_transition_counts": dict(counts),
+        "annotation_alignment_counts": {side: dict(values) for side, values in alignment_counts.items()},
+        "mean_diff_rougeL": sum(row["diff_rougeL"] for row in rows) / len(rows),
+        "mean_lexical_absence_delta": sum(row["lexical_absence_delta"] for row in rows) / len(rows),
+        "generation_provenance": provenance or {"status": "not_provided"},
+        "annotation_scope": "Original FRANK BART labels apply only to matching annotated summary text.",
     }
-    for et, rs in by_error.items():
-        c = Counter(r["judgement"] for r in rs)
-        summary["by_error_type"][et] = {
-            "n": len(rs),
-            "judgement_counts": dict(c),
-            "mean_diff_rougeL": sum(r["diff_rougeL"] for r in rs) / len(rs),
-            "mean_unsupported_delta": sum(r["unsupported_delta"] for r in rs) / len(rs),
-        }
-    for group_name, pred in (("error_labelled", True), ("no_error_labelled", False)):
-        rs = [r for r in rows if bool(r.get("has_bart_error")) is pred]
-        c = Counter(r["judgement"] for r in rs)
-        summary[group_name] = {
-            "n": len(rs),
-            "judgement_counts": dict(c),
-            "mean_diff_rougeL": sum(r["diff_rougeL"] for r in rs) / len(rs) if rs else 0,
-            "mean_unsupported_delta": sum(r["unsupported_delta"] for r in rs) / len(rs) if rs else 0,
-        }
-    with open(output_dir / "subset_comparison_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    md = ["# FRANK BART-Error Subset Comparison", "", f"- Samples: {summary['n_samples']} (BART annotated: 46 error-labelled + 204 no-error-labelled)", f"- Judgements: {summary['judgement_counts']}", f"- Mean ΔROUGE-L: {summary['mean_diff_rougeL']:.4f}", f"- Mean unsupported delta: {summary['mean_unsupported_delta']:.4f}", f"- Error-labelled group: {summary['error_labelled']}", f"- No-error-labelled group: {summary['no_error_labelled']}", "", "## By Error Type", "", "| Error | N | likely_improved | likely_worse | neutral | mean ΔL | unsupported Δ |", "|---|---:|---:|---:|---:|---:|---:|"]
-    for et, s in sorted(summary["by_error_type"].items()):
-        jc=s["judgement_counts"]
-        md.append(f"| {et} | {s['n']} | {jc.get('likely_improved',0)} | {jc.get('likely_worse',0)} | {jc.get('neutral_or_changed',0)} | {s['mean_diff_rougeL']:.4f} | {s['mean_unsupported_delta']:.4f} |")
-    (output_dir / "subset_comparison_summary.md").write_text("\n".join(md), encoding="utf-8")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / "subset_comparison.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    write_json(output_dir / "subset_comparison.json", rows)
+    write_json(output_dir / "subset_comparison_summary.json", summary)
+    md = ["# FRANK paired descriptive diagnostics", "", f"- Samples: {len(rows)}",
+          f"- {SCREEN_NOTE}", "- Original annotation matching preserves case and punctuation.",
+          f"- Annotation alignment: {summary['annotation_alignment_counts']}",
+          f"- Mean change in ROUGE-L: {summary['mean_diff_rougeL']:.4f}",
+          f"- Mean lexical absence count change: {summary['mean_lexical_absence_delta']:.4f}",
+          "", "| Lexical screen transition | Count |", "|---|---:|"]
+    md.extend(f"| {key} | {counts[key]} |" for key in TRANSITIONS)
+    md.extend(["", "These counts are not factuality correction or preservation rates.",
+               "Generation provenance is recorded in subset_comparison_summary.json."])
+    (output_dir / "subset_comparison_summary.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     return summary
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--model_name', required=True)
-    ap.add_argument('--checkpoint', default=None)
-    ap.add_argument('--baseline_dir', required=True)
-    ap.add_argument('--output_dir', required=True)
-    ap.add_argument('--frank_data', required=True)
-    ap.add_argument('--device', default='cuda')
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--model_name", required=True)
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--baseline_dir", required=True)
+    ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--frank_data", required=True)
+    ap.add_argument("--device", default="cuda")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--compare_only", action="store_true", help="Recompute diagnostics from cached text without loading models")
+    mode.add_argument("--regenerate", action="store_true", help="Explicitly overwrite generation caches")
     args = ap.parse_args()
-    baseline = load_or_generate(args.model_name, None, Path(args.frank_data), Path(args.baseline_dir), args.device)
-    finetuned = load_or_generate(args.model_name, args.checkpoint, Path(args.frank_data), Path(args.output_dir), args.device)
-    summary = compare(baseline, finetuned, Path(args.output_dir)) if args.checkpoint else None
-    if summary:
-        print(json.dumps(summary, ensure_ascii=False))
+    baseline_dir, output_dir = Path(args.baseline_dir), Path(args.output_dir)
+    if (args.checkpoint or args.compare_only) and baseline_dir.resolve() == output_dir.resolve():
+        ap.error("Baseline and finetuned output directories must differ")
+    subset, annotations = build_bart_error_subset(args.frank_data)
+    provenance = {}
+    if args.compare_only:
+        baseline, provenance["baseline"] = read_cached_for_comparison(baseline_dir)
+        finetuned, provenance["finetuned"] = read_cached_for_comparison(output_dir)
     else:
-        print(f"baseline generated/loaded: {len(baseline)} samples")
+        if args.checkpoint and not Path(args.checkpoint).is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {args.checkpoint}")
+        baseline = load_or_generate(args.model_name, None, args.frank_data, baseline_dir, args.device, args.regenerate)
+        if not args.checkpoint:
+            print(f"Baseline generated/loaded: {len(baseline)} samples")
+            return
+        finetuned = load_or_generate(args.model_name, args.checkpoint, args.frank_data, output_dir, args.device, args.regenerate)
+        _, provenance["baseline"] = read_cached_for_comparison(baseline_dir)
+        _, provenance["finetuned"] = read_cached_for_comparison(output_dir)
+    original_map = {row["hash"]: row for row in subset}
+    for side, records in (("baseline", baseline), ("finetuned", finetuned)):
+        indexed = index_results(records, side)
+        if indexed.keys() != original_map.keys():
+            raise ValueError(f"{side} does not cover the current BART-annotated article subset")
+        for key, row in indexed.items():
+            if any(row[field] != original_map[key].get(field, "") for field in ("article", "reference")):
+                raise ValueError(f"{side} cached source/reference differs from FRANK data for {key}")
+    provenance["current_frank_data_sha256"] = {name: file_sha256(Path(args.frank_data) / name)
+                                                for name in ("benchmark_data.json", "human_annotations.json")}
+    summary = compare(baseline, finetuned, output_dir, annotations, provenance)
+    print(json.dumps(summary, ensure_ascii=False))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
