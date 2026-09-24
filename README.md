@@ -1,6 +1,6 @@
 # Temporal Brain–Model Alignment for Factuality-Related Linguistic Cues in Generative Language Models
 
-Code accompanying **“Temporal Brain-Model Alignment for Factuality-Related Linguistic Cues in Generative Language Models”** by Wenqing Zhou, Zhejun Zhang, Shaoting Guo, Lin Zhang, and Lei Li.
+Code accompanying **“Temporal Brain-Model Alignment for Factuality-Related Linguistic Cues in Generative Language Models”** by Wenqing Zhou, Shaoting Guo, Lin Zhang, and Lei Li.
 
 This repository contains both parts of the project:
 
